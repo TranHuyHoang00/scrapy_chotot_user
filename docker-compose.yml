@@ -1,0 +1,110 @@
+# Dịch vụ local cho dự án:
+#   - redis: chống trùng tin, cache số điện thoại / trang người bán. Luôn chạy.
+#   - kafka, kafka-init, kafka-ui: Kafka local để test khi không dùng Kafka dev/Hydra.
+#     Chỉ chạy khi bật profile "kafka":  docker compose --profile kafka up -d
+#     Spider dùng Kafka local khi .env có KAFKA_LOCAL=true (README mục 3.2, 4.2).
+name: chotot
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: chotot_redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # Kafka 1 node, chế độ KRaft (không cần Zookeeper), không SSL.
+  #   Từ máy (spider):          localhost:9092
+  #   Từ container khác (UI):   kafka:29092
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: chotot_kafka
+    profiles: ["kafka"]
+    # Image chạy bằng user appuser, không ghi được vào volume mới tạo (thuộc root)
+    user: "0:0"
+    ports:
+      - "${KAFKA_LOCAL_PORT:-9092}:9092"
+    environment:
+      # Phải là UUID 16 byte dạng base64url (22 ký tự), sai định dạng thì Kafka không format được storage
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      # CONTROLLER chỉ dùng nội bộ container (1 node). Kafka 3.9 tự thêm listener controller vào
+      # advertised.listeners (lấy từ đây) nên không được để 0.0.0.0, phải là địa chỉ cụ thể (localhost)
+      KAFKA_LISTENERS: HOST://0.0.0.0:9092,INTERNAL://0.0.0.0:29092,CONTROLLER://localhost:9093
+      KAFKA_ADVERTISED_LISTENERS: HOST://localhost:${KAFKA_LOCAL_PORT:-9092},INTERNAL://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: HOST:PLAINTEXT,INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 1
+      # Giữ message 7 ngày
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:29092 > /dev/null 2>&1",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  # Tạo sẵn 3 topic (tên lấy từ .env, giống spider) rồi tự thoát
+  kafka-init:
+    image: apache/kafka:3.9.0
+    container_name: chotot_kafka_init
+    profiles: ["kafka"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for topic in "${KAFKA_TOPIC_INPUT:-hydra-profile-scheduler-chotot}" "${KAFKA_TOPIC_LOG:-hydra-spider-log}" \
+                     "${KAFKA_TOPIC_POST:-hydra-chotot-post_lss-h}" "${KAFKA_TOPIC_POST_IMAGES:-hydra-images-incoming}" \
+                     "${KAFKA_TOPIC_PROFILE_BIO:-hydra-profile-bio-chotot_lss-h}" \
+                     "${KAFKA_TOPIC_PROFILE_AVATAR:-hydra-images-incoming-avatar}"; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists \
+            --topic "$$topic" --partitions 1 --replication-factor 1
+        done
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list
+    restart: "no"
+
+  # Giao diện web xem topic / message: http://localhost:8080
+  kafka-ui:
+    image: kafbat/kafka-ui:latest
+    container_name: chotot_kafka_ui
+    profiles: ["kafka"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "${KAFKA_UI_PORT:-8080}:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      DYNAMIC_CONFIG_ENABLED: "false"
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  kafka_data:
